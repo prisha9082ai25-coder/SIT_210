@@ -1,406 +1,607 @@
-#include <ArduinoBLE.h>  // Provides Bluetooth Low Energy (BLE) communication.
-#include <Wire.h>        // Provides I2C communication for connecting the light sensor.
-#include <BH1750.h>      // Provides functions for reading light intensity from the BH1750 sensor.
+
+#include <ArduinoBLE.h>
+#include <Wire.h>
+#include <BH1750.h>
+
+// ============================================================
+// SIT210 TASK 8.1HD - AUDIO PROCESSING AND VOICE ACTIVATED
+// LIGHTING SYSTEM
+//
+// Hardware:
+// - Arduino Nano 33 IoT
+// - BH1750 light intensity sensor
+// - Bathroom LED
+// - Hallway LED
+// - Exhaust fan indicator LED
+// - Raspberry Pi (communicates through Bluetooth)
+//
+// System functionality:
+// 1. Automatically controls room lighting using light readings.
+// 2. Receives voice commands from the Raspberry Pi through BLE.
+// 3. Allows independent manual control of bathroom and hallway
+//    lights.
+// 4. Allows manual control of the exhaust fan indicator.
+// 5. Supports switching between automatic and manual modes.
+//
+// ============================================================
+
 
 // ============================================================
 // 1. LED PIN CONFIGURATION
 // ============================================================
 
-// Define the Arduino digital pins connected to each LED.
-// The LEDs represent the bathroom light, hallway light and fan status.
-// Each LED should have an appropriate series resistor.
+// Each output is connected to a separate Arduino digital pin.
+
 const int bathroomLED = 10;
 const int hallwayLED = 11;
 const int fanLED = 12;
+
 
 // ============================================================
 // 2. LIGHT SENSOR CONFIGURATION
 // ============================================================
 
-// Create an object to communicate with the BH1750 light sensor.
-// The sensor measures ambient light intensity in lux.
+// Create a BH1750 sensor object to measure ambient light
+// intensity in lux.
+
 BH1750 lightSensor;
 
-// Tracks whether the sensor was detected successfully during setup.
-// If initialisation fails, automatic lighting and sensor readings
-// will not be performed as if the sensor were working.
+// Indicates whether the BH1750 sensor was successfully
+// initialised during system startup.
+
 bool sensorReady = false;
+
 
 // ============================================================
 // 3. AUTOMATIC LIGHTING SETTINGS
 // ============================================================
 
-// Controls whether automatic lighting is enabled.
-// When true, the two room LEDs respond to the measured light level.
-// When false, automatic light-level control is disabled.
+// Determines whether automatic lighting control is enabled.
+// When enabled, the Arduino controls the room lights using
+// readings received from the light sensor.
+
 bool automaticMode = true;
 
-// Lux threshold below which the system switches both room lights ON.
-// A low lux reading indicates that the surrounding area is dark.
-const float LIGHT_ON_LEVEL = 20.0;
+// Light thresholds used by the automatic lighting system.
+//
+// Below 20 lux: Turn the room lights ON.
+// Above 40 lux: Turn the room lights OFF.
+//
+// The difference between the two thresholds prevents
+// frequent switching when the light level fluctuates.
 
-// Lux threshold above which the system switches both room lights OFF.
-// This threshold is higher than the ON threshold to reduce rapid
-// switching when the measured light level fluctuates near a threshold.
+const float LIGHT_ON_LEVEL = 20.0;
 const float LIGHT_OFF_LEVEL = 40.0;
 
-// Stores the last state set by the automatic lighting function.
-// true means both bathroom and hallway LEDs were set ON.
-// false means both were set OFF.
-// Manual commands can control the two LEDs separately, so this
-// variable represents the automatic system's shared light state.
+// Tracks the current automatic lighting state.
+
 bool lightsAreOn = false;
+
 
 // ============================================================
 // 4. SENSOR READING TIMING
 // ============================================================
 
-// Stores the time, in milliseconds, when the sensor was last read.
-// millis() measures elapsed time since the Arduino started running.
+// Stores the time of the previous sensor reading.
+
 unsigned long lastSensorRead = 0;
 
-// The sensor reading interval is 2000 milliseconds, or 2 seconds.
-// Using millis() avoids adding a delay that would block other tasks.
+// The light sensor is checked every 2000 milliseconds
+// (2 seconds) instead of continuously.
+
 const unsigned long SENSOR_INTERVAL = 2000;
 
+
 // ============================================================
-// 5. BLUETOOTH LOW ENERGY (BLE) CONFIGURATION
+// 5. BLUETOOTH LOW ENERGY CONFIGURATION
 // ============================================================
 
-// Create the BLE service that groups the characteristics used
-// for communication between the Raspberry Pi and Arduino.
-//
-// Keep this UUID unchanged because the Raspberry Pi program uses it
-// to identify the Arduino's smart-lighting service.
+// Define a BLE service to allow the Raspberry Pi to
+// communicate with the Arduino.
+
 BLEService controlService(
   "7A1B0001-6D5A-4C4E-9A10-123456789001"
 );
 
-// Create a BLE characteristic through which the Raspberry Pi
-// writes commands to the Arduino, such as "bathroom on".
-//
-// BLEWrite allows the central device (Raspberry Pi) to write data.
-// The characteristic can hold a string of up to 40 characters.
+// Characteristic used by the Raspberry Pi to send
+// voice-recognised commands to the Arduino.
+
 BLEStringCharacteristic commandCharacteristic(
   "7A1B0002-6D5A-4C4E-9A10-123456789001",
   BLEWrite,
   40
 );
 
-// Create a BLE characteristic for sending information back
-// to the Raspberry Pi.
-//
-// BLERead allows the Raspberry Pi to read the latest response.
-// BLENotify allows the Arduino to notify subscribed clients when
-// the characteristic value changes.
+// Characteristic used by the Arduino to provide responses
+// and status information to the Raspberry Pi.
+
 BLEStringCharacteristic responseCharacteristic(
   "7A1B0003-6D5A-4C4E-9A10-123456789001",
   BLERead | BLENotify,
   40
 );
 
+
 // ============================================================
 // 6. FUNCTION TO CONTROL BOTH ROOM LIGHTS
 // ============================================================
 
-// This function switches the bathroom and hallway LEDs together.
-// It is used by automatic lighting when both lights should have
-// the same state.
+// Controls both bathroom and hallway LEDs simultaneously.
 //
-// The function also updates lightsAreOn so the automatic controller
-// knows the state it last applied.
+// This function is used by the automatic lighting system
+// when a shared light-level reading is below or above
+// the configured thresholds.
+
 void setLights(bool state) {
+
   digitalWrite(bathroomLED, state ? HIGH : LOW);
   digitalWrite(hallwayLED, state ? HIGH : LOW);
+
+  // Update the stored lighting state.
+
   lightsAreOn = state;
+
+  Serial.print("Both room lights: ");
+  Serial.println(state ? "ON" : "OFF");
 }
 
+
 // ============================================================
-// 7. SETUP: RUNS ONCE WHEN THE ARDUINO STARTS
+// 7. AUTOMATIC LIGHT SENSOR CONTROL
 // ============================================================
+
+// Periodically reads the BH1750 sensor and controls the
+// bathroom and hallway lights when automatic mode is enabled.
+//
+// The sensor reading is used to determine whether the
+// environment is sufficiently dark or bright.
+
+void updateAutomaticLighting() {
+
+  // Check whether the sensor reading interval has elapsed.
+
+  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
+
+    lastSensorRead = millis();
+
+    // Continue only if the light sensor was initialised.
+
+    if (sensorReady) {
+
+      // Read the current ambient light intensity in lux.
+
+      float lux = lightSensor.readLightLevel();
+
+      Serial.print("Ambient light: ");
+      Serial.print(lux);
+      Serial.println(" lux");
+
+      // Automatic lighting operates only when automatic
+      // mode is enabled and the sensor returns a valid reading.
+
+      if (automaticMode && lux >= 0) {
+
+        // If the environment is darker than 20 lux,
+        // switch ON both room lights.
+
+        if (lux < LIGHT_ON_LEVEL && !lightsAreOn) {
+
+          setLights(true);
+
+          Serial.println(
+            "Dark: bathroom and hallway lights ON."
+          );
+        }
+
+        // If the environment becomes brighter than 40 lux,
+        // switch OFF both room lights.
+
+        else if (lux > LIGHT_OFF_LEVEL && lightsAreOn) {
+
+          setLights(false);
+
+          Serial.println(
+            "Bright: bathroom and hallway lights OFF."
+          );
+        }
+      }
+    }
+  }
+}
+
+
+// ============================================================
+// 8. SETUP
+// ============================================================
+
+// Initialises the Arduino hardware, light sensor and
+// Bluetooth communication when the system starts.
 
 void setup() {
-  // Start serial communication so status messages and sensor
-  // readings can be viewed in the Arduino IDE Serial Monitor.
+
   Serial.begin(9600);
 
-  // Configure all three LED pins as outputs.
+  // Configure the bathroom, hallway and fan output pins.
+
   pinMode(bathroomLED, OUTPUT);
   pinMode(hallwayLED, OUTPUT);
   pinMode(fanLED, OUTPUT);
 
-  // Start with both room lights OFF.
-  // Also initialise the fan-status LED to OFF.
+  // Set all output indicators to their initial OFF state.
+
   setLights(false);
   digitalWrite(fanLED, LOW);
 
-  // Start I2C communication, which the BH1750 uses to exchange data.
+  // Initialise I2C communication for the BH1750 sensor.
+
   Wire.begin();
+
   Serial.println("Starting BH1750...");
 
-  // Initialise the BH1750 in continuous high-resolution mode.
-  // In this mode, the sensor repeatedly measures ambient light.
-  // The return value indicates whether initialisation succeeded.
+  // Start the light sensor in continuous high-resolution mode.
+
   sensorReady = lightSensor.begin(
     BH1750::CONTINUOUS_HIGH_RES_MODE
   );
 
-  // Report the sensor's initialisation result.
+  // Check whether sensor initialisation was successful.
+
   if (sensorReady) {
+
     Serial.println("BH1750 ready.");
+
   } else {
-    // Automatic light control is skipped if initialisation failed.
+
     Serial.println("WARNING: BH1750 not detected.");
   }
 
+  // Initialise Bluetooth Low Energy communication.
+
   Serial.println("Starting BLE...");
 
-  // Initialise Bluetooth Low Energy.
-  // If BLE cannot start, report the problem and stop normal execution.
   if (!BLE.begin()) {
+
     Serial.println("ERROR: BLE failed.");
 
-    // Remain here because BLE communication is essential
-    // for receiving commands from the Raspberry Pi.
+    // Stop execution if Bluetooth cannot initialise.
+
     while (true) {
       delay(1000);
     }
   }
 
-  // Give the Arduino a recognisable BLE device name.
-  // This name can be displayed when searching for BLE devices.
+  // Set the Bluetooth device name so that the Raspberry Pi
+  // can identify the Arduino.
+
   BLE.setLocalName("SmartLighting");
 
-  // Associate the control service with the device advertisement.
-  // This helps a central device identify the service it needs.
   BLE.setAdvertisedService(controlService);
 
-  // Add the command and response characteristics to the service.
-  controlService.addCharacteristic(commandCharacteristic);
-  controlService.addCharacteristic(responseCharacteristic);
+  // Register the command and response characteristics
+  // with the Bluetooth service.
 
-  // Register the configured service with the BLE system.
+  controlService.addCharacteristic(
+    commandCharacteristic
+  );
+
+  controlService.addCharacteristic(
+    responseCharacteristic
+  );
+
   BLE.addService(controlService);
 
-  // Set the initial values of the BLE characteristics.
-  // An empty command value means no command has been received yet.
-  // "Ready" tells a client reading the response that the system
-  // has completed its initial setup.
+  // Initialise Bluetooth communication values.
+
   commandCharacteristic.writeValue("");
+
   responseCharacteristic.writeValue("Ready");
 
-  // Start advertising so the Raspberry Pi can discover the Arduino.
+  // Make the Arduino discoverable to the Raspberry Pi.
+
   BLE.advertise();
 
-  // Print startup information for debugging and demonstration.
   Serial.println("SmartLighting ready.");
   Serial.println("Automatic mode is ON.");
 }
 
+
 // ============================================================
-// 8. FUNCTION TO PROCESS COMMANDS RECEIVED OVER BLE
+// 9. FUNCTION TO PROCESS BLUETOOTH COMMANDS
 // ============================================================
 
-// This function receives a text command from the Raspberry Pi,
-// checks which command was sent, and performs the corresponding action.
+// Receives text commands from the Raspberry Pi and performs
+// the corresponding operation on the Arduino.
 //
-// Supported commands include:
-// "automatic on" / "automatic off"
-// "bathroom on" / "bathroom off"
-// "hallway on" / "hallway off"
-// "fan on" / "fan off"
-// "light" to request a current light-level reading.
-void processCommand(String command) {
-  // Remove unnecessary spaces from the beginning and end.
-  command.trim();
+// The Raspberry Pi processes microphone input, converts
+// speech into text and sends the recognised command through
+// Bluetooth Low Energy.
+//
+// This function interprets the received command and controls
+// the appropriate output.
 
-  // Convert the command to lowercase so that command matching
-  // does not depend on the capitalisation of the received text.
+void processCommand(String command) {
+
+  // Remove unnecessary spaces and convert the command
+  // into lowercase for consistent command comparison.
+
+  command.trim();
   command.toLowerCase();
 
-  // Display the received command in the Serial Monitor.
   Serial.print("Command received: ");
   Serial.println(command);
 
-  // Enable automatic lighting.
-  // The sensor will control both room lights when automaticMode
-  // is true and the required light thresholds are crossed.
+
+  // ----------------------------------------------------------
+  // AUTOMATIC MODE ON
+  // ----------------------------------------------------------
+
+  // Enables automatic lighting based on the light sensor.
+
   if (command == "automatic on") {
+
     automaticMode = true;
-    responseCharacteristic.writeValue("Automatic mode on");
+
+    lightsAreOn =
+      (digitalRead(bathroomLED) == HIGH &&
+       digitalRead(hallwayLED) == HIGH);
+
+    responseCharacteristic.writeValue(
+      "Automatic mode on"
+    );
+
     Serial.println("Automatic lighting enabled.");
   }
 
-  // Disable automatic lighting without directly switching the
-  // room LEDs ON or OFF. Their current states are retained.
+
+  // ----------------------------------------------------------
+  // AUTOMATIC MODE OFF
+  // ----------------------------------------------------------
+
+  // Disables automatic lighting and allows manual control.
+
   else if (command == "automatic off") {
+
     automaticMode = false;
-    responseCharacteristic.writeValue("Automatic mode off");
+
+    responseCharacteristic.writeValue(
+      "Automatic mode off"
+    );
+
     Serial.println("Automatic lighting disabled.");
   }
 
-  // Turn the bathroom LED ON manually.
-  // Manual room-light commands disable automatic mode so that
-  // the sensor controller does not immediately override the request.
+
+  // ----------------------------------------------------------
+  // BATHROOM LIGHT ON
+  // ----------------------------------------------------------
+
+  // Enables manual mode and switches ON only the bathroom LED.
+
   else if (command == "bathroom on") {
+
     automaticMode = false;
+
     digitalWrite(bathroomLED, HIGH);
-    responseCharacteristic.writeValue("Bathroom on; manual mode");
+
+    Serial.println("Bathroom LED pin 10 set HIGH.");
+
+    responseCharacteristic.writeValue(
+      "Bathroom on; manual mode"
+    );
   }
 
-  // Turn the bathroom LED OFF manually.
+
+  // ----------------------------------------------------------
+  // BATHROOM LIGHT OFF
+  // ----------------------------------------------------------
+
+  // Switches OFF only the bathroom LED.
+
   else if (command == "bathroom off") {
+
     automaticMode = false;
+
     digitalWrite(bathroomLED, LOW);
-    responseCharacteristic.writeValue("Bathroom off; manual mode");
+
+    Serial.println("Bathroom LED pin 10 set LOW.");
+
+    responseCharacteristic.writeValue(
+      "Bathroom off; manual mode"
+    );
   }
 
-  // Turn the hallway LED ON manually.
+
+  // ----------------------------------------------------------
+  // HALLWAY LIGHT ON
+  // ----------------------------------------------------------
+
+  // Switches ON only the hallway LED.
+
   else if (command == "hallway on") {
+
     automaticMode = false;
+
     digitalWrite(hallwayLED, HIGH);
-    responseCharacteristic.writeValue("Hallway on; manual mode");
+
+    Serial.println("Hallway LED pin 11 set HIGH.");
+
+    responseCharacteristic.writeValue(
+      "Hallway on; manual mode"
+    );
   }
 
-  // Turn the hallway LED OFF manually.
+
+  // ----------------------------------------------------------
+  // HALLWAY LIGHT OFF
+  // ----------------------------------------------------------
+
+  // Switches OFF only the hallway LED.
+
   else if (command == "hallway off") {
+
     automaticMode = false;
+
     digitalWrite(hallwayLED, LOW);
-    responseCharacteristic.writeValue("Hallway off; manual mode");
+
+    Serial.println("Hallway LED pin 11 set LOW.");
+
+    responseCharacteristic.writeValue(
+      "Hallway off; manual mode"
+    );
   }
 
-  // Turn the fan-status LED ON.
-  // This is only an indicator LED; it does not control a real fan.
+
+  // ----------------------------------------------------------
+  // EXHAUST FAN ON
+  // ----------------------------------------------------------
+
+  // Switches ON the fan indicator LED connected to pin 12.
+  // This output represents the exhaust fan activation.
+
   else if (command == "fan on") {
+
     digitalWrite(fanLED, HIGH);
-    responseCharacteristic.writeValue("Fan indicator on");
+
+    Serial.println("Fan indicator LED pin 12 set HIGH.");
+
+    responseCharacteristic.writeValue(
+      "Fan indicator on"
+    );
   }
 
-  // Turn the fan-status LED OFF.
+
+  // ----------------------------------------------------------
+  // EXHAUST FAN OFF
+  // ----------------------------------------------------------
+
+  // Switches OFF the fan indicator LED.
+
   else if (command == "fan off") {
+
     digitalWrite(fanLED, LOW);
-    responseCharacteristic.writeValue("Fan indicator off");
+
+    Serial.println("Fan indicator LED pin 12 set LOW.");
+
+    responseCharacteristic.writeValue(
+      "Fan indicator off"
+    );
   }
 
-  // Return the current measured light level to the Raspberry Pi.
+
+  // ----------------------------------------------------------
+  // LIGHT SENSOR READING
+  // ----------------------------------------------------------
+
+  // Allows the Raspberry Pi to request the current
+  // ambient light intensity from the BH1750 sensor.
+
   else if (command == "light") {
 
-    // Only attempt a sensor reading if initialisation succeeded.
     if (sensorReady) {
+
       float lux = lightSensor.readLightLevel();
 
-      // A negative reading is treated as a sensor-reading error.
       if (lux >= 0) {
-        // Convert the numerical reading to a string with one
-        // decimal place so it can be transmitted through BLE.
+
+        // Convert the sensor reading into a text value
+        // before sending it through Bluetooth.
+
         String result = String(lux, 1);
 
-        // Send the light-level value to the Raspberry Pi.
         responseCharacteristic.writeValue(result);
 
-        // Also display the reading locally for debugging.
         Serial.print("Light level: ");
         Serial.print(result);
         Serial.println(" lux");
+
       } else {
-        // Report a failed reading instead of returning a value
-        // that could be mistaken for a valid light measurement.
-        responseCharacteristic.writeValue("Sensor error");
+
+        responseCharacteristic.writeValue(
+          "Sensor error"
+        );
       }
+
     } else {
-      // Tell the Raspberry Pi that the sensor was not detected
-      // during setup and cannot provide a reading.
-      responseCharacteristic.writeValue("Sensor unavailable");
+
+      responseCharacteristic.writeValue(
+        "Sensor unavailable"
+      );
     }
   }
 
-  // Handle unsupported commands safely.
-  // No LED state is deliberately changed in this branch.
+
+  // ----------------------------------------------------------
+  // UNKNOWN COMMAND
+  // ----------------------------------------------------------
+
+  // Handle commands that do not match any recognised option.
+
   else {
-    responseCharacteristic.writeValue("Unknown command");
+
+    responseCharacteristic.writeValue(
+      "Unknown command"
+    );
+
     Serial.println("Unknown command.");
   }
 }
 
+
 // ============================================================
-// 9. MAIN LOOP: REPEATS WHILE THE ARDUINO IS RUNNING
+// 10. MAIN LOOP
 // ============================================================
+
+// Continuously manages Bluetooth communication, sensor
+// monitoring and incoming commands from the Raspberry Pi.
 
 void loop() {
-  // Process BLE communication events, such as connection activity
-  // and incoming or outgoing characteristic data.
+
+  // Process pending Bluetooth Low Energy events.
+
   BLE.poll();
 
-  // ----------------------------------------------------------
-  // 9A. READ THE AMBIENT LIGHT SENSOR
-  // ----------------------------------------------------------
+  // Check the ambient light level and update automatic
+  // lighting when required.
 
-  // Check whether two seconds have elapsed since the previous
-  // scheduled sensor reading. This avoids using delay(2000),
-  // which would pause other loop operations for two seconds.
-  if (millis() - lastSensorRead >= SENSOR_INTERVAL) {
-    lastSensorRead = millis();
+  updateAutomaticLighting();
 
-    // Read the sensor only if it was successfully initialised.
-    if (sensorReady) {
-      float lux = lightSensor.readLightLevel();
+  // Check whether a central device (Raspberry Pi) is connected.
 
-      // Print the current ambient light level in lux.
-      Serial.print("Ambient light: ");
-      Serial.print(lux);
-      Serial.println(" lux");
-
-      // Automatic control is performed only when automatic mode
-      // is enabled and the sensor reading is not negative.
-      if (automaticMode && lux >= 0) {
-
-        // If the area is darker than 20 lux and the lights are
-        // currently recorded as OFF, turn both lights ON.
-        if (lux < LIGHT_ON_LEVEL && !lightsAreOn) {
-          setLights(true);
-          Serial.println("Dark: bathroom and hallway lights ON.");
-        }
-
-        // If the area is brighter than 40 lux and the lights are
-        // currently recorded as ON, turn both lights OFF.
-        //
-        // The gap between 20 and 40 lux is hysteresis. It helps
-        // prevent rapid ON/OFF switching near a single threshold.
-        else if (lux > LIGHT_OFF_LEVEL && lightsAreOn) {
-          setLights(false);
-          Serial.println("Bright: bathroom and hallway lights OFF.");
-        }
-      }
-    }
-  }
-
-  // ----------------------------------------------------------
-  // 9B. CHECK FOR A RASPBERRY PI BLE CONNECTION
-  // ----------------------------------------------------------
-
-  // Check whether a central BLE device, such as the Raspberry Pi,
-  // has connected to this Arduino.
   BLEDevice central = BLE.central();
 
   if (central) {
+
     Serial.println("Raspberry Pi connected.");
 
-    // Continue handling communication while the central device
-    // remains connected. BLE.poll() keeps BLE events processing.
+    // Continue communication while the Raspberry Pi
+    // remains connected to the Arduino.
+
     while (central.connected()) {
+
+      // Process Bluetooth communication events.
+
       BLE.poll();
 
-      // Check whether the Raspberry Pi has written a new command
-      // to the command characteristic.
+      // Continue automatic sensor monitoring even while
+      // the Raspberry Pi is connected.
+
+      updateAutomaticLighting();
+
+      // Check whether a new command has been received
+      // through the BLE command characteristic.
+
       if (commandCharacteristic.written()) {
 
-        // Retrieve the received text and pass it to the command
-        // processing function for validation and execution.
-        processCommand(commandCharacteristic.value());
+        String receivedCommand =
+          commandCharacteristic.value();
+
+        // Pass the received command to the command
+        // processing function.
+
+        processCommand(receivedCommand);
       }
     }
 
-    // This message is printed when the central device disconnects.
     Serial.println("Raspberry Pi disconnected.");
   }
 }
