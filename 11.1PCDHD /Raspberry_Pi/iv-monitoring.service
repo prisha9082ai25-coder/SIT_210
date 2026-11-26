@@ -1,0 +1,31 @@
+
+# SIT210 - Two-Bed IV Monitoring System
+# Automatic dashboard startup using systemd
+
+[Unit]
+Description=Two Bed IV Monitoring Dashboard
+
+# Start after network and Bluetooth services
+After=network-online.target bluetooth.service
+Wants=network-online.target bluetooth.service
+
+[Service]
+Type=simple
+
+# Raspberry Pi user account
+User=prisha_01
+
+# Project directory
+WorkingDirectory=/home/prisha_01/IV_Monitoring
+
+# Execute the Python application using its virtual environment
+ExecStart=/home/prisha_01/IV_Monitoring/.venv/bin/python -u /home/prisha_01/IV_Monitoring/app.py
+
+# Automatically restart the application if it exits
+Restart=always
+RestartSec=5
+
+[Install]
+
+# Enable automatic startup during system boot
+WantedBy=multi-user.target
